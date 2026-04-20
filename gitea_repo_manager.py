@@ -50,7 +50,7 @@ EDITOREN = [
     ("Pulsar",  "pulsar"),
 ]
 DATEIMANAGER = [
-    "nautilus", "thunar", "nemo", "pcmanfm", "dolphin", "caja", "xdg-open",
+     "caja", "thunar", "nautilus", "nemo", "pcmanfm", "dolphin", "xdg-open",
 ]
 # Terminals werden der Reihe nach probiert; jedes Element: (befehl, [extra_args_vor_cmd])
 TERMINALS = [
