@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gitea Repository Manager v1.5
+Gitea Repository Manager v1.6
 ==============================
-Verwaltung von Gitea-Repositories inkl.:
-  - git clone mit Live-Ausgabe und Editor-Auswahl
+Verwaltung von Gitea/Forgejo-Repositories inkl.:
+  - git clone mit Live-Ausgabe, Editor-Auswahl und Branch-Auswahl
   - Vorhandene-Repos-Dialog mit git pull Option
   - Push-Assistent: Dateivergleich, LINT, PUSH, PUSH2BRANCH, AUTOcommit
+  - Branch wechseln direkt im Push-Assistenten (git checkout)
   - Bulk-Clone: gesamte Organisation oder gesamtes Gitea mit allen Branches
 
-Verwendung:        python3 gitea_manager.py
+Bugfixes v1.6:
+  - HTTP 500 beim Anlegen von Repos behoben: gitignores/license werden nur
+    bei auto_init=True gesendet (Forgejo-Kompatibilitaet)
+  - Neues Pflichtfeld default_branch (Standard: 'main')
+  - Verbesserte Fehlerdiagnose: Server-Response-Body bei HTTP 500 wird angezeigt
+  - Branch-Auswahl im Clone-Dialog (via API oder git ls-remote)
+  - Branch-Wechsel im Push-Assistenten
+
+Verwendung:        python3 gitea_repo_manager.py [--nur-privat]
+Optionen:
+  --nur-privat     Erzwingt Private-Sichtbarkeit fuer alle neu angelegten Repos.
+                   Die Sichtbarkeits-Auswahl im Dialog wird deaktiviert.
 Abhaengigkeiten:   pip install requests
 System:            sudo apt install git meld
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
+import argparse
 import json
 import os
 import shutil
@@ -106,15 +119,35 @@ def format_datum(r):
 
 
 def http_fehler(exc):
+    # Liefert eine lesbare Fehlermeldung fuer HTTP-Ausnahmen.
+    # Bei 500 wird versucht, den Server-Response-Body einzubeziehen.
     code = exc.response.status_code if exc.response is not None else "?"
     meldungen = {
         401: "Authentifizierung fehlgeschlagen.\nBitte API-Token pruefen.",
         403: "Zugriff verweigert.",
         404: "Ressource nicht gefunden.",
         409: "Konflikt - Repository existiert moeglicherweise bereits.",
-        422: "Ungueltige Eingabe.",
+        422: "Ungueltige Eingabe (Feldname oder Wert ungueltig).",
     }
-    return meldungen.get(code, "HTTP-Fehler {}: {}".format(code, exc))
+    basis = meldungen.get(code, "HTTP-Fehler {}: {}".format(code, exc))
+    # END meldungen.get(...)
+    # Bei 500 Serverdetails aus dem Response-Body lesen
+    if code not in meldungen and exc.response is not None:
+        try:
+            body   = exc.response.json()
+            detail = body.get("message", "") or str(body)
+            if detail:
+                basis += "\n\nServer-Meldung:\n{}".format(detail[:600])
+            # END if detail
+        except Exception:
+            raw = (exc.response.text or "")[:400].strip()
+            if raw:
+                basis += "\n\nServer-Antwort:\n{}".format(raw)
+            # END if raw
+        # END try/except
+    # END if code not in meldungen
+    return basis
+# END http_fehler
 
 
 def zentriere(fenster, parent):
@@ -266,9 +299,31 @@ class GiteaClient:
     def get_commit_count(self, org, repo):
         return self._total_count("/repos/{}/{}/commits".format(org, repo))
     def get_branches(self, org, repo):
+        # Gibt alle Branch-Objekte {name, ...} fuer ein Repository zurueck.
         return self._alle_seiten("/repos/{}/{}/branches".format(org, repo))
+    def get_branch_names(self, org, repo):
+        """Gibt nur die Branch-Namen als Liste zurueck."""
+        try:
+            return [b["name"] for b in self.get_branches(org, repo)]
+        except Exception:
+            return []
+        # END try/except
+    # END get_branch_names
+
+    def get_user_info(self):
+        """Liefert (email, name) des eingeloggten Users aus /api/v1/user.
+        name ist full_name wenn gesetzt, sonst login.
+        Wirft eine Exception wenn der API-Call fehlschlägt."""
+        user  = self._get("/user")
+        email = (user.get("email") or "").strip()
+        name  = (user.get("full_name") or user.get("login") or "").strip()
+        return email, name
+    # END get_user_info
     def create_repo(self, org, payload):
+        # POST /orgs/{org}/repos - Neues Repository in einer Organisation anlegen.
+        # HINWEIS: gitignores und license DUERFEN NUR bei auto_init=true gesendet werden.
         return self._post("/orgs/{}/repos".format(org), payload)
+    # END create_repo
     def delete_repo(self, org, repo):
         self._delete("/repos/{}/{}".format(org, repo))
 
@@ -381,7 +436,8 @@ class KonfigDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 class NeuesRepoDialog(tk.Toplevel):
 
-    def __init__(self, parent, org, client, on_success):
+    def __init__(self, parent, org, client, on_success, nur_privat=False):
+        # nur_privat: wenn True, wird Private erzwungen und die Auswahl gesperrt.
         super().__init__(parent)
         self.title("Neues Repository in '{}'".format(org))
         self.resizable(False, False)
@@ -390,8 +446,10 @@ class NeuesRepoDialog(tk.Toplevel):
         self.org        = org
         self.client     = client
         self.on_success = on_success
+        self.nur_privat = nur_privat
         self._baue_ui()
         zentriere(self, parent)
+    # END __init__
 
     def _baue_ui(self):
         tk.Label(self, text="Neues Repository - {}".format(self.org),
@@ -417,31 +475,61 @@ class NeuesRepoDialog(tk.Toplevel):
         self.desc_var = tk.StringVar()
         lbl(1, "Beschreibung"); entry(1, self.desc_var)
         lbl(2, "Sichtbarkeit")
-        self.privat_var = tk.BooleanVar(value=False)
+        # Bei --nur-privat wird Private fest gesetzt und die Auswahl deaktiviert
+        self.privat_var = tk.BooleanVar(value=True if self.nur_privat else False)
         vf = tk.Frame(form, bg=C["bg2"])
         vf.grid(row=2, column=1, padx=8, pady=4, sticky="w")
         for txt, val in [("Public", False), ("Private", True)]:
+            rb_state = "disabled" if self.nur_privat else "normal"
+            rb_fg    = C["fg_dim"] if self.nur_privat else C["fg"]
             tk.Radiobutton(vf, text=txt, variable=self.privat_var, value=val,
-                           bg=C["bg2"], fg=C["fg"], selectcolor=C["bg3"],
-                           activebackground=C["bg2"],
+                           state=rb_state,
+                           bg=C["bg2"], fg=rb_fg, selectcolor=C["bg3"],
+                           activebackground=C["bg2"], disabledforeground=C["fg_dim"],
                            font=("Monospace", 10)).pack(side="left", padx=(0, 12))
+        # END for txt, val in Sichtbarkeit
+
+        # Hinweis-Label wenn --nur-privat aktiv
+        if self.nur_privat:
+            tk.Label(vf, text="  (gesperrt durch --nur-privat)",
+                     bg=C["bg2"], fg=C["danger"],
+                     font=("Monospace", 8)).pack(side="left")
+        # END if self.nur_privat
         lbl(3, "Initialisieren")
         self.init_var = tk.BooleanVar(value=True)
         tk.Checkbutton(form, text="README.md anlegen", variable=self.init_var,
                        bg=C["bg2"], fg=C["fg"], selectcolor=C["bg3"],
                        activebackground=C["bg2"],
                        font=("Monospace", 10)).grid(row=3, column=1, padx=8, pady=4, sticky="w")
-        lbl(4, ".gitignore-Template")
+
+        # Standard-Branch-Name – bei Forgejo MUSS dieser Wert explizit gesetzt werden
+        lbl(4, "Standard-Branch *")
+        self.branch_var = tk.StringVar(value="main")
+        tk.Entry(form, textvariable=self.branch_var, width=20,
+                 bg=C["bg3"], fg=C["fg"], insertbackground=C["fg"],
+                 relief="flat", font=("Monospace", 10)).grid(
+            row=4, column=1, padx=8, pady=4, sticky="w")
+
+        # gitignore/Lizenz: DÜRFEN NUR bei auto_init=True gesendet werden (sonst HTTP 500)
+        lbl(5, ".gitignore-Template")
+        tk.Label(form, text="  (nur bei 'Initialisieren')", bg=C["bg2"],
+                 fg=C["fg_dim"], font=("Monospace", 7)).grid(
+            row=5, column=0, sticky="se", padx=12, pady=(0, 4))
         self.gitignore_var = tk.StringVar(value="")
         ttk.Combobox(form, textvariable=self.gitignore_var,
                      values=GITIGNORE_TEMPLATES, state="readonly", width=20,
-                     font=("Monospace", 10)).grid(row=4, column=1, padx=8, pady=4, sticky="w")
-        lbl(5, "Lizenz")
+                     font=("Monospace", 10)).grid(row=5, column=1, padx=8, pady=4, sticky="w")
+        lbl(6, "Lizenz")
+        tk.Label(form, text="  (nur bei 'Initialisieren')", bg=C["bg2"],
+                 fg=C["fg_dim"], font=("Monospace", 7)).grid(
+            row=6, column=0, sticky="se", padx=12, pady=(0, 4))
         self.lizenz_var = tk.StringVar(value="")
         ttk.Combobox(form, textvariable=self.lizenz_var,
                      values=LIZENZEN, state="readonly", width=20,
-                     font=("Monospace", 10)).grid(row=5, column=1, padx=8, pady=4, sticky="w")
-        tk.Label(self, text="* Pflichtfeld", bg=C["bg2"], fg=C["fg_dim"],
+                     font=("Monospace", 10)).grid(row=6, column=1, padx=8, pady=4, sticky="w")
+
+        tk.Label(self, text="* Pflichtfeld  |  gitignore/Lizenz nur wenn 'Initialisieren' aktiv",
+                 bg=C["bg2"], fg=C["fg_dim"],
                  font=("Monospace", 8)).pack(anchor="w", padx=16)
         tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=16, pady=8)
         bf = tk.Frame(self, bg=C["bg2"])
@@ -451,19 +539,49 @@ class NeuesRepoDialog(tk.Toplevel):
         self._ok = flat_btn(bf, "Repository erstellen", self._erstellen,
                             C["success"], C["bg"], bold=True)
         self._ok.pack(side="left")
+    # END _baue_ui
 
     def _erstellen(self):
+        # Validiert Eingaben und sendet POST an Forgejo/Gitea API.
+        # BUGFIX: gitignores/license nur bei auto_init=True senden – sonst HTTP 500.
         name = self.name_var.get().strip()
         if not name:
             messagebox.showwarning("Pflichtfeld",
                                    "Bitte einen Repository-Namen eingeben.", parent=self)
             return
-        payload = {"name": name, "description": self.desc_var.get().strip(),
-                   "private": self.privat_var.get(), "auto_init": self.init_var.get()}
-        gi = self.gitignore_var.get().strip()
-        lz = self.lizenz_var.get().strip()
-        if gi: payload["gitignores"] = gi
-        if lz: payload["license"]    = lz
+        # Validierung: Branch-Name darf kein Leerzeichen oder Pfadtrenner enthalten
+        branch = self.branch_var.get().strip() or "main"
+        if " " in branch or "/" in branch:
+            messagebox.showwarning("Ungültiger Branch-Name",
+                                   "Branch-Name darf keine Leerzeichen oder '/' enthalten.",
+                                   parent=self)
+            return
+        # END if ungültiger Branch-Name
+
+        auto_init = self.init_var.get()
+        payload   = {
+            "name":           name,
+            # Sicherheitsebene 2: auch wenn UI manipuliert wurde, bleibt private=True
+            "private":        True if self.nur_privat else self.privat_var.get(),
+            "auto_init":      auto_init,
+            "default_branch": branch,
+        }
+        desc = self.desc_var.get().strip()
+        if desc:
+            payload["description"] = desc
+        # END if desc
+
+        # KRITISCH: gitignores + license NUR bei auto_init=True – Forgejo 500 sonst
+        if auto_init:
+            gi = self.gitignore_var.get().strip()
+            lz = self.lizenz_var.get().strip()
+            if gi:
+                payload["gitignores"] = gi
+            if lz:
+                payload["license"] = lz
+            # END if gi / lz
+        # END if auto_init
+
         self._ok.config(state="disabled", text="Erstelle ...")
 
         def run():
@@ -475,7 +593,10 @@ class NeuesRepoDialog(tk.Toplevel):
                 self.after(0, lambda: self._err(msg))
             except Exception as e:
                 self.after(0, lambda: self._err(str(e)))
+            # END try/except
+        # END run
         threading.Thread(target=run, daemon=True).start()
+    # END _erstellen
 
     def _ok_msg(self, full_name):
         messagebox.showinfo("Erstellt",
@@ -492,7 +613,19 @@ class NeuesRepoDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 # Dialog: Editor & Dateimanager nach Clone
 # ---------------------------------------------------------------------------
+
+# Editoren die einen Ordner-Pfad als Argument verstehen (IDE-artiges Öffnen).
+# Editoren die NICHT in dieser Menge sind, bekommen stattdessen README.md.
+_ORDNER_FAEHIGE_EDITOREN = {"code", "pulsar", "atom", "subl", "zed", "kate", "gedit"}
+
 class OeffnenDialog(tk.Toplevel):
+    """
+    Erscheint nach erfolgreichem git clone.
+    Primäraktion: Ordner im gewählten Editor öffnen.
+    Optional:     Dateimanager parallel öffnen (Standard: an).
+    Optional:     README.md zusätzlich öffnen (nur bei ordner-fähigen Editoren
+                  sinnvoll; bei anderen wird README.md sowieso geöffnet).
+    """
 
     def __init__(self, parent, repo_pfad: Path, repo_name: str):
         super().__init__(parent)
@@ -505,83 +638,139 @@ class OeffnenDialog(tk.Toplevel):
         self._baue_ui()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         zentriere(self, parent)
+    # END __init__
 
     def _baue_ui(self):
+        # ── Kopf: Erfolgsmeldung + Pfad ──────────────────────────────────────
         tk.Label(self, text="Repository erfolgreich geklont",
                  font=("Monospace", 12, "bold"),
                  bg=C["bg2"], fg=C["success"]).pack(padx=20, pady=(16, 2), anchor="w")
         tk.Label(self, text=str(self.repo_pfad),
                  font=("Monospace", 9), bg=C["bg2"], fg=C["fg_dim"]).pack(
-            padx=20, pady=(0, 12), anchor="w")
+            padx=20, pady=(0, 10), anchor="w")
+
         tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(0, 10))
-        tk.Label(self, text="README.md oeffnen mit:",
+
+        # ── PRIMÄR: Ordner öffnen mit … ──────────────────────────────────────
+        tk.Label(self, text="Ordner öffnen mit:",
                  font=("Monospace", 10, "bold"),
-                 bg=C["bg2"], fg=C["accent"]).pack(padx=20, pady=(0, 6), anchor="w")
+                 bg=C["bg2"], fg=C["accent"]).pack(padx=20, pady=(0, 4), anchor="w")
+
         self._editor_var = tk.StringVar(value="")
         ed_frame = tk.Frame(self, bg=C["bg2"])
         ed_frame.pack(padx=20, fill="x")
+
         for anzeige, befehl in EDITOREN:
             verfuegbar = shutil.which(befehl) is not None
+            ordner_ok  = befehl in _ORDNER_FAEHIGE_EDITOREN
+            hinweis    = ""
+            if not verfuegbar:
+                hinweis = "  (nicht installiert)"
+            elif not ordner_ok:
+                hinweis = "  (öffnet README.md)"
+            # END if/elif
             tk.Radiobutton(
                 ed_frame,
-                text=anzeige + ("" if verfuegbar else "  (nicht installiert)"),
+                text=anzeige + hinweis,
                 variable=self._editor_var, value=befehl,
                 state="normal" if verfuegbar else "disabled",
-                bg=C["bg2"], fg=C["fg"] if verfuegbar else C["fg_dim"],
+                bg=C["bg2"],
+                fg=C["fg"] if verfuegbar else C["fg_dim"],
                 selectcolor=C["bg3"], activebackground=C["bg2"],
                 disabledforeground=C["fg_dim"],
                 font=("Monospace", 10)).pack(anchor="w", padx=8, pady=2)
             if verfuegbar and not self._editor_var.get():
                 self._editor_var.set(befehl)
+            # END if verfuegbar and not self._editor_var
+        # END for anzeige, befehl
+
         tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(10, 6))
-        self._fm_var = tk.BooleanVar(value=False)
-        dm = finde_dateimanager()
-        dm_lbl = "Dateimanager parallel oeffnen" + (
+
+        # ── Dateimanager: Standard EIN ────────────────────────────────────────
+        dm     = finde_dateimanager()
+        dm_lbl = "Dateimanager parallel öffnen" + (
             "  ({})".format(dm) if dm else "  (kein Dateimanager gefunden)")
+        self._fm_var = tk.BooleanVar(value=True)   # Standard: an
         tk.Checkbutton(self, text=dm_lbl, variable=self._fm_var,
                        state="normal" if dm else "disabled",
                        bg=C["bg2"], fg=C["fg"], selectcolor=C["bg3"],
                        activebackground=C["bg2"], disabledforeground=C["fg_dim"],
-                       font=("Monospace", 10)).pack(padx=20, pady=(0, 6), anchor="w")
-        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(4, 8))
+                       font=("Monospace", 10)).pack(padx=20, pady=(0, 4), anchor="w")
+
+        # ── SEKUNDÄR: README.md zusätzlich öffnen ────────────────────────────
+        self._readme_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self, text="README.md zusätzlich öffnen",
+                       variable=self._readme_var,
+                       bg=C["bg2"], fg=C["fg_dim"], selectcolor=C["bg3"],
+                       activebackground=C["bg2"],
+                       font=("Monospace", 9)).pack(padx=20, pady=(0, 6), anchor="w")
+
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", padx=20, pady=(4, 10))
+
+        # ── Buttons ──────────────────────────────────────────────────────────
         bf = tk.Frame(self, bg=C["bg2"])
         bf.pack(fill="x", padx=20, pady=(0, 16))
-        flat_btn(bf, "Nur Dateimanager", self._nur_fm,
-                 C["bg3"], C["accent2"]).pack(side="left")
         flat_btn(bf, "Schliessen", self.destroy,
-                 C["bg3"], C["fg_dim"]).pack(side="left", padx=(8, 0))
-        flat_btn(bf, "README oeffnen", self._oeffne,
-                 C["accent"], C["bg"], bold=True).pack(side="right")
+                 C["bg3"], C["fg_dim"]).pack(side="left")
+        self._oeffne_btn = flat_btn(bf, "Ordner öffnen  ▶", self._oeffne,
+                                     C["accent"], C["bg"], bold=True)
+        self._oeffne_btn.pack(side="right")
+    # END _baue_ui
 
     def _stelle_readme_sicher(self) -> Path:
+        # Erstellt README.md wenn nicht vorhanden; gibt den Pfad zurück.
         readme = self.repo_pfad / "README.md"
         if not readme.exists():
             with open(readme, "w", encoding="utf-8") as fh:
                 fh.write("# {}\n\n".format(self.repo_name))
+            # END with
         return readme
+    # END _stelle_readme_sicher
 
     def _oeffne(self):
+        """Öffnet den Repo-Ordner im gewählten Editor.
+        Ordner-fähige Editoren (VS Code, Pulsar …) bekommen den Ordner-Pfad.
+        Andere Editoren bekommen README.md als Fallback.
+        Bei aktivierter README-Checkbox wird README.md zusätzlich als zweites
+        Argument übergeben (VS Code fokussiert dann direkt darauf)."""
         editor = self._editor_var.get()
         if not editor:
             messagebox.showwarning("Kein Editor",
                                    "Bitte einen Editor auswaehlen.", parent=self)
             return
-        readme = self._stelle_readme_sicher()
+        # END if not editor
+
+        ordner_ok = editor in _ORDNER_FAEHIGE_EDITOREN
+        readme    = self._stelle_readme_sicher()
+
+        # Argumente zusammenstellen
+        if ordner_ok:
+            # Primär: Ordner öffnen; bei gesetzter README-Checkbox auch README.md
+            args = [editor, str(self.repo_pfad)]
+            if self._readme_var.get():
+                args.append(str(readme))
+            # END if self._readme_var
+        else:
+            # Fallback für Editoren ohne Ordner-Unterstützung (z.B. Geany)
+            args = [editor, str(readme)]
+        # END if ordner_ok
+
         try:
-            subprocess.Popen([editor, str(readme)],
-                             start_new_session=True, env={**os.environ})
+            subprocess.Popen(args, start_new_session=True, env={**os.environ})
         except Exception as e:
-            messagebox.showerror("Fehler",
-                                 "{} konnte nicht gestartet werden:\n{}".format(editor, e),
-                                 parent=self)
+            messagebox.showerror(
+                "Fehler",
+                "{} konnte nicht gestartet werden:\n{}".format(editor, e),
+                parent=self)
             return
+        # END try/except
+
         if self._fm_var.get():
             oeffne_verzeichnis(self.repo_pfad, parent=self)
-        self.destroy()
+        # END if self._fm_var
 
-    def _nur_fm(self):
-        oeffne_verzeichnis(self.repo_pfad, parent=self)
         self.destroy()
+    # END _oeffne
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +1114,7 @@ class PushAssistant(tk.Toplevel):
     # ── UI ────────────────────────────────────────────────────────────────
 
     def _baue_ui(self):
-        # Header
+        # Header: zeigt Repo-Name, Pfad und aktuellen Branch
         hdr = tk.Frame(self, bg=C["bg2"], pady=8)
         hdr.pack(fill="x")
         tk.Label(hdr, text="  Push-Assistent: {}".format(self.repo_name),
@@ -934,6 +1123,11 @@ class PushAssistant(tk.Toplevel):
         tk.Label(hdr, text=str(self.repo_pfad),
                  font=("Monospace", 8), bg=C["bg2"],
                  fg=C["fg_dim"]).pack(side="left", padx=(0, 10))
+        # Aktuellen Branch anzeigen
+        self._branch_lbl = tk.Label(hdr, text="Branch: …",
+                                     font=("Monospace", 9, "bold"),
+                                     bg=C["bg2"], fg=C["accent2"])
+        self._branch_lbl.pack(side="right", padx=14)
 
         # Toolbar
         tb = tk.Frame(self, bg=C["bg3"], pady=5)
@@ -941,6 +1135,10 @@ class PushAssistant(tk.Toplevel):
 
         flat_btn(tb, "Aktualisieren", self._aktualisiere,
                  C["bg3"], C["accent"]).pack(side="left", padx=4)
+
+        # Branch-Wechsel-Button
+        flat_btn(tb, "Branch wechseln", self._branch_wechseln,
+                 C["bg3"], C["accent2"]).pack(side="left", padx=(4, 12))
 
         # Diff-Programm
         tk.Label(tb, text="Diff:", bg=C["bg3"],
@@ -1027,7 +1225,13 @@ class PushAssistant(tk.Toplevel):
     # ── Dateiliste aktualisieren ───────────────────────────────────────────
 
     def _aktualisiere(self):
+        # Aktualisiert Dateiliste, Statistik und Branch-Anzeige.
         self.diff_prog = self._diff_var.get().strip() or DIFF_PROGRAMM_STD
+
+        # Aktuellen Branch ermitteln und im Header anzeigen
+        b_result = git_run(self.repo_pfad, ["rev-parse", "--abbrev-ref", "HEAD"])
+        branch   = b_result.stdout.strip() or "?"
+        self._branch_lbl.config(text="Branch: {}".format(branch))
 
         # git status --porcelain
         result = git_run(self.repo_pfad, ["status", "--porcelain"])
@@ -1042,6 +1246,7 @@ class PushAssistant(tk.Toplevel):
             if " -> " in pfad:
                 pfad = pfad.split(" -> ")[-1].strip()
             zeilen.append((code, Path(pfad)))
+        # END for line
 
         # Alte Zeilen entfernen
         for w in self._zeilen:
@@ -1053,6 +1258,7 @@ class PushAssistant(tk.Toplevel):
             self._leer_lbl.pack(pady=20)
             self._stats_lbl.config(text="Keine Aenderungen.")
             return
+        # END if not zeilen
 
         for code, rel_pfad in zeilen:
             zeile = DateiZeile(
@@ -1062,9 +1268,66 @@ class PushAssistant(tk.Toplevel):
                 self.diff_prog)
             zeile.pack(fill="x", pady=1)
             self._zeilen.append(zeile)
+        # END for code, rel_pfad
 
         # Statistik
         self._aktualisiere_stats()
+    # END _aktualisiere
+
+    def _branch_wechseln(self):
+        """Zeigt lokale Branches und checkt den gewählten aus (git checkout)."""
+        result  = git_run(self.repo_pfad, ["branch", "-a"])
+        branches = []
+        for line in result.stdout.splitlines():
+            b = line.strip().lstrip("* ").strip()
+            if not b or b.startswith("(HEAD") or "->" in b:
+                continue
+            # Remotes: "remotes/origin/main" → "origin/main"
+            if b.startswith("remotes/"):
+                b = b[len("remotes/"):]
+            if b not in branches:
+                branches.append(b)
+            # END if b not in branches
+        # END for line
+
+        if not branches:
+            messagebox.showinfo("Keine Branches",
+                                "Keine Branches gefunden (kein git-Repo?).",
+                                parent=self)
+            return
+        # END if not branches
+
+        # Ungespeicherte Änderungen prüfen
+        status = git_run(self.repo_pfad, ["status", "--porcelain"])
+        if status.stdout.strip():
+            if not messagebox.askyesno(
+                "Ungespeicherte Änderungen",
+                "Es gibt ungesicherte Änderungen.\n"
+                "Trotzdem Branch wechseln? (Änderungen bleiben als 'dirty' erhalten)",
+                parent=self):
+                return
+            # END if not messagebox.askyesno
+        # END if status.stdout.strip()
+
+        def nach_wahl(branch: str):
+            # Führe git checkout aus
+            r = git_run(self.repo_pfad, ["checkout", branch])
+            if r.returncode == 0:
+                messagebox.showinfo(
+                    "Branch gewechselt",
+                    "Erfolgreich zu '{}' gewechselt.".format(branch),
+                    parent=self)
+                self._aktualisiere()
+            else:
+                messagebox.showerror(
+                    "Checkout fehlgeschlagen",
+                    r.stderr or r.stdout or "Unbekannter Fehler",
+                    parent=self)
+            # END if r.returncode == 0
+        # END nach_wahl
+
+        BranchWahlDialog(self, branches, callback=nach_wahl)
+    # END _branch_wechseln
 
     def _aktualisiere_stats(self):
         result = git_run(self.repo_pfad, ["diff", "--stat", "HEAD"])
@@ -1176,23 +1439,26 @@ class PushAssistant(tk.Toplevel):
 # ---------------------------------------------------------------------------
 class CloneDialog(tk.Toplevel):
 
-    def __init__(self, parent, org, repo_name, clone_url, token):
+    def __init__(self, parent, org, repo_name, clone_url, token, client=None):
+        # client ist optional; wenn übergeben, werden Branches via API geladen.
         super().__init__(parent)
         self.title("Klonen: {}/{}".format(org, repo_name))
         self.resizable(True, True)
-        self.minsize(640, 460)
+        self.minsize(640, 500)
         self.configure(bg=C["bg2"])
         self.grab_set()
         self.org            = org
         self.repo_name      = repo_name
         self.clone_url      = clone_url
         self.token          = token
+        self.client         = client   # GiteaClient oder None
         self._proc          = None
         self._running       = False
         self._fertig_pfad   = None
         self._baue_ui()
         self.protocol("WM_DELETE_WINDOW", self._schliessen)
         zentriere(self, parent)
+    # END __init__
 
     def _baue_ui(self):
         tk.Label(self,
@@ -1222,6 +1488,28 @@ class CloneDialog(tk.Toplevel):
         tk.Button(opt, text="...", command=self._waehle_ziel,
                   bg=C["bg3"], fg=C["accent"],
                   relief="flat", font=("Monospace", 9), padx=4).grid(row=0, column=4)
+
+        # Branch-Auswahl (Zeile 1 im options-Frame)
+        tk.Label(opt, text="Branch:", bg=C["bg2"],
+                 fg=C["fg_dim"], font=("Monospace", 9)).grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
+        self._branch_var = tk.StringVar(value="")
+        self._branch_cb  = ttk.Combobox(opt, textvariable=self._branch_var,
+                                         values=[], state="readonly", width=22,
+                                         font=("Monospace", 9))
+        self._branch_cb.grid(row=1, column=1, padx=(0, 8), pady=(4, 0))
+        self._branch_laden_btn = tk.Button(
+            opt, text="Branches laden",
+            command=self._lade_branches,
+            bg=C["bg3"], fg=C["accent2"],
+            activebackground=C["accent"], activeforeground=C["bg"],
+            relief="flat", font=("Monospace", 9), padx=6)
+        self._branch_laden_btn.grid(row=1, column=2, columnspan=2,
+                                     padx=(0, 4), pady=(4, 0), sticky="w")
+        tk.Label(opt, text="(leer = default-Branch)",
+                 bg=C["bg2"], fg=C["fg_dim"],
+                 font=("Monospace", 8)).grid(row=1, column=4, padx=(4, 0),
+                                              pady=(4, 0), sticky="w")
 
         pf = tk.Frame(self, bg=C["bg3"])
         pf.pack(fill="x", padx=16, pady=(0, 8))
@@ -1261,6 +1549,7 @@ class CloneDialog(tk.Toplevel):
         self._clone_btn.pack(side="right")
 
     def _build_url(self):
+        # Baut die Clone-URL abhängig vom gewählten Protokoll.
         proto = self._proto.get()
         base  = self.clone_url
         if proto == "HTTPS (Token)":
@@ -1271,11 +1560,68 @@ class CloneDialog(tk.Toplevel):
             return base
         p = urlparse(base)
         return "git@{}:{}".format(p.netloc, p.path.lstrip("/"))
+    # END _build_url
 
     def _upd_prev(self):
         url     = self._build_url()
         anzeige = url.replace(self.token, "***") if self.token in url else url
         self._prev_var.set(anzeige)
+
+    def _lade_branches(self):
+        """Lädt verfügbare Remote-Branches – via API wenn client vorhanden, sonst git ls-remote."""
+        self._branch_laden_btn.config(state="disabled", text="Lade ...")
+        self._branch_cb.config(values=[], state="disabled")
+        self._branch_var.set("")
+
+        def fetch():
+            namen = []
+            # Variante 1: Gitea/Forgejo API (bevorzugt, da schneller)
+            if self.client and self.org and self.repo_name:
+                try:
+                    namen = self.client.get_branch_names(self.org, self.repo_name)
+                except Exception:
+                    namen = []
+                # END try/except
+            # END if self.client
+
+            # Variante 2: git ls-remote als Fallback
+            if not namen:
+                try:
+                    url = self._build_url()
+                    result = subprocess.run(
+                        ["git", "ls-remote", "--heads", url],
+                        capture_output=True, text=True, timeout=20,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                    for line in result.stdout.splitlines():
+                        # Format: <sha>\trefs/heads/<branch>
+                        parts = line.strip().split("\t", 1)
+                        if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+                            namen.append(parts[1][len("refs/heads/"):])
+                        # END if parts
+                    # END for line
+                except Exception:
+                    pass
+                # END try/except
+            # END if not namen
+
+            self.after(0, lambda: self._zeige_branches(namen))
+        # END fetch
+
+        threading.Thread(target=fetch, daemon=True).start()
+    # END _lade_branches
+
+    def _zeige_branches(self, namen: list):
+        """Befüllt die Branch-Combobox nach dem Laden."""
+        self._branch_laden_btn.config(state="normal", text="Branches laden")
+        if not namen:
+            self._log("Keine Branches gefunden (oder Verbindungsfehler).\n", "err")
+            return
+        # END if not namen
+        self._branch_cb.config(values=namen, state="readonly")
+        self._branch_var.set(namen[0])
+        self._log("Branches geladen: {}\n".format(", ".join(namen[:8]) +
+                  (" ..." if len(namen) > 8 else "")), "info")
+    # END _zeige_branches
 
     def _waehle_ziel(self):
         v = filedialog.askdirectory(title="Zielverzeichnis",
@@ -1283,6 +1629,8 @@ class CloneDialog(tk.Toplevel):
         if v:
             self._ziel.set(v)
             self._log("Ziel geaendert: {}\n".format(v), "dim")
+        # END if v
+    # END _waehle_ziel
 
     def _starte(self):
         if self._running:
@@ -1321,12 +1669,23 @@ class CloneDialog(tk.Toplevel):
         self._running = True
         self._clone_btn.config(state="disabled", text="Klone ...")
         self._pb.start(12)
-        self._log("\n$ git clone [url] {}\n".format(self.repo_name), "info")
+
+        # Optional: bestimmten Branch auschecken
+        branch         = self._branch_var.get().strip()
+        branch_anzeige = " --branch {}".format(branch) if branch else ""
+        self._log("\n$ git clone{} [url] {}\n".format(
+            branch_anzeige, self.repo_name), "info")
 
         def run():
             try:
+                # --branch einfügen wenn ein Branch gewählt wurde
+                cmd = ["git", "clone", "--progress"]
+                if branch:
+                    cmd += ["--branch", branch]
+                # END if branch
+                cmd += [url, str(repo_pfad)]
                 proc = subprocess.Popen(
-                    ["git", "clone", "--progress", url, str(repo_pfad)],
+                    cmd,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1,
                     env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
@@ -1335,14 +1694,83 @@ class CloneDialog(tk.Toplevel):
                     self.after(0, lambda z=line: self._log(z))
                 proc.wait()
                 rc = proc.returncode
+
+                # Nach erfolgreichem Clone: git config user.email / user.name setzen
+                if rc == 0:
+                    self._setze_git_user_config(repo_pfad)
+                # END if rc == 0
+
                 self.after(0, lambda: self._fertig(rc, repo_pfad))
             except FileNotFoundError:
                 self.after(0, lambda: self._fehler(
                     "git nicht gefunden.\nInstallation: sudo apt install git"))
             except Exception as e:
                 self.after(0, lambda: self._fehler(str(e)))
+            # END try/except
+        # END run
 
         threading.Thread(target=run, daemon=True).start()
+    # END _starte
+
+    def _setze_git_user_config(self, repo_pfad: Path):
+        """Setzt git config user.email und user.name aus der Gitea/Forgejo-API.
+        Wird im Hintergrund-Thread nach erfolgreichem Clone aufgerufen.
+        Schlägt die API fehl, wird eine Warnung geloggt – Clone-Ergebnis bleibt unberührt."""
+        if not self.client:
+            self.after(0, lambda: self._log(
+                "\nHinweis: kein API-Client – git user config nicht gesetzt.\n", "dim"))
+            return
+        # END if not self.client
+
+        try:
+            email, name = self.client.get_user_info()
+        except Exception as exc:
+            self.after(0, lambda: self._log(
+                "\nWarnung: User-Info konnte nicht abgerufen werden: {}\n"
+                "git config user.* muss manuell gesetzt werden.\n".format(exc), "err"))
+            return
+        # END try/except
+
+        probleme = []
+
+        # user.email – nur setzen wenn nicht leer
+        if email:
+            r = git_run(repo_pfad, ["config", "user.email", email])
+            if r.returncode == 0:
+                self.after(0, lambda: self._log(
+                    "  git config user.email {}\n".format(email), "ok"))
+            else:
+                probleme.append("user.email: {}".format(r.stderr.strip()))
+            # END if r.returncode
+        else:
+            self.after(0, lambda: self._log(
+                "\nWarnung: API liefert keine E-Mail – user.email nicht gesetzt.\n"
+                "Bitte in Gitea unter Einstellungen > Profil eine E-Mail hinterlegen.\n",
+                "err"))
+        # END if email
+
+        # user.name – nur setzen wenn nicht leer
+        if name:
+            r = git_run(repo_pfad, ["config", "user.name", name])
+            if r.returncode == 0:
+                self.after(0, lambda: self._log(
+                    "  git config user.name {}\n".format(name), "ok"))
+            else:
+                probleme.append("user.name: {}".format(r.stderr.strip()))
+            # END if r.returncode
+        else:
+            self.after(0, lambda: self._log(
+                "\nWarnung: API liefert keinen Namen – user.name nicht gesetzt.\n"
+                "Bitte in Gitea unter Einstellungen > Profil einen Namen hinterlegen.\n",
+                "err"))
+        # END if name
+
+        if probleme:
+            msg = "\n".join(probleme)
+            self.after(0, lambda: self._log(
+                "\nFehler beim Setzen der git-Konfiguration:\n{}\n".format(msg), "err"))
+        # END if probleme
+    # END _setze_git_user_config
 
     def _fertig(self, rc, repo_pfad):
         self._running = False
@@ -2296,7 +2724,8 @@ class AufraeumdialogCP(tk.Toplevel):
 # ---------------------------------------------------------------------------
 class App(tk.Tk):
 
-    def __init__(self):
+    def __init__(self, nur_privat: bool = False):
+        # nur_privat: wenn True, können neue Repos nur als Private angelegt werden.
         super().__init__()
         self.title("Gitea Repository Manager")
         self.geometry("1200x640")
@@ -2304,11 +2733,12 @@ class App(tk.Tk):
         self.configure(bg=C["bg"])
 
         # WICHTIG: self.cfg, NICHT self.config  (tk.Tk.config() ist eine Methode!)
-        self.cfg    = {}
-        self.client = None
-        self.repos  = []
-        self.orgs   = []
-        self._counts = {}
+        self.cfg        = {}
+        self.client     = None
+        self.repos      = []
+        self.orgs       = []
+        self._counts    = {}
+        self.nur_privat = nur_privat
 
         self._style_setup()
         self._baue_menue()
@@ -2319,6 +2749,7 @@ class App(tk.Tk):
             self._verbinden(saved)
         else:
             self.after(100, self._oeffne_konfig)
+    # END __init__
 
     def _style_setup(self):
         s = ttk.Style(self)
@@ -2365,6 +2796,14 @@ class App(tk.Tk):
         tk.Label(hdr, text="  Gitea Repository Manager",
                  font=("Monospace", 15, "bold"),
                  bg=C["bg2"], fg=C["accent"]).pack(side="left", padx=10)
+
+        # Banner wenn --nur-privat aktiv
+        if self.nur_privat:
+            tk.Label(hdr, text="  🔒 NUR PRIVAT",
+                     font=("Monospace", 10, "bold"),
+                     bg=C["bg2"], fg=C["danger"]).pack(side="left", padx=(0, 10))
+        # END if self.nur_privat
+
         self._hdr_lbl = tk.Label(hdr, text="Nicht verbunden",
                                  font=("Monospace", 9),
                                  bg=C["bg2"], fg=C["fg_dim"])
@@ -2423,6 +2862,7 @@ class App(tk.Tk):
         self._km.add_command(label="Klonen",            command=self._clone_repo)
         self._km.add_command(label="Bulk-Clone",        command=self._oeffne_bulk_clone)
         self._km.add_command(label="Push-Assistent",    command=self._push_assistent)
+        self._km.add_command(label="Branch auschecken", command=self._checkout_branch)
         self._km.add_separator()
         self._km.add_command(label="URL kopieren",      command=self._kopiere_url)
         self._km.add_command(label="Loeschen",          command=self._loesche_repo)
@@ -2613,6 +3053,8 @@ class App(tk.Tk):
         self._sb("URL kopiert: {}".format(url))
 
     def _clone_repo(self):
+        # Öffnet CloneDialog mit dem aktuell selektierten Repository.
+        # client wird übergeben, damit Branch-Namen per API geladen werden können.
         name = self._sel()
         if not name:
             return
@@ -2620,7 +3062,9 @@ class App(tk.Tk):
         rd  = next((r for r in self.repos if r.get("name") == name), None)
         clone_url = rd.get("clone_url", "") if rd else \
             "{}/{}/{}.git".format(self.cfg.get("url", "").rstrip("/"), org, name)
-        CloneDialog(self, org, name, clone_url, self.cfg.get("token", ""))
+        CloneDialog(self, org, name, clone_url, self.cfg.get("token", ""),
+                    client=self.client)
+    # END _clone_repo
 
     def _push_assistent(self):
         """Oeffnet Push-Assistent fuer ein lokal vorhandenes Repo."""
@@ -2636,6 +3080,33 @@ class App(tk.Tk):
                 return
             pfad = Path(pfad)
         PushAssistant(self, pfad, name)
+
+    def _checkout_branch(self):
+        """Öffnet CloneDialog mit vorgeladenem Branch-Selector für das gewählte Repo.
+        Alternativ: wenn das Repo bereits lokal vorhanden ist, öffnet den PushAssistant
+        und bietet dort den Branch-Wechsel an."""
+        name = self._sel()
+        if not name:
+            return
+        org   = self._org_var.get()
+        pfad  = Path(CLONE_ZIEL) / name
+
+        if pfad.exists():
+            # Lokal vorhanden → Push-Assistent mit Branch-Wechsel
+            pa = PushAssistant(self, pfad, name)
+            # Nach kurzer Verzögerung direkt Branch-Wechsel-Dialog öffnen
+            self.after(400, pa._branch_wechseln)
+        else:
+            # Nicht vorhanden → Clone-Dialog öffnen (Branch dort wählbar)
+            rd        = next((r for r in self.repos if r.get("name") == name), None)
+            clone_url = rd.get("clone_url", "") if rd else \
+                "{}/{}/{}.git".format(self.cfg.get("url", "").rstrip("/"), org, name)
+            dlg = CloneDialog(self, org, name, clone_url,
+                              self.cfg.get("token", ""), client=self.client)
+            # Branches sofort laden
+            self.after(300, dlg._lade_branches)
+        # END if pfad.exists()
+    # END _checkout_branch
 
     def _loesche_repo(self):
         name = self._sel()
@@ -2675,12 +3146,17 @@ class App(tk.Tk):
                      callback=lambda cfg: self._verbinden(cfg) if cfg else None)
 
     def _oeffne_neues_repo(self):
+        # Öffnet den Dialog zum Anlegen eines neuen Repos.
+        # Gibt self.nur_privat an den Dialog weiter, damit die Sperre greift.
         org = self._org_var.get()
         if not org:
             messagebox.showinfo("Hinweis",
                                 "Bitte zuerst eine Organisation auswaehlen.")
             return
-        NeuesRepoDialog(self, org, self.client, on_success=self._lade_repos)
+        NeuesRepoDialog(self, org, self.client,
+                        on_success=self._lade_repos,
+                        nur_privat=self.nur_privat)
+    # END _oeffne_neues_repo
 
     def _oeffne_cherrypicker(self):
         CherrypickerDialog(self,
@@ -2713,5 +3189,27 @@ class App(tk.Tk):
 # Start
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app = App()
+    parser = argparse.ArgumentParser(
+        prog="gitea_repo_manager",
+        description="Gitea / Forgejo Repository Manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Beispiele:\n"
+            "  python3 gitea_repo_manager.py\n"
+            "  python3 gitea_repo_manager.py --nur-privat\n"
+        ),
+    )
+    parser.add_argument(
+        "--nur-privat",
+        action="store_true",
+        default=False,
+        help=(
+            "Erzwingt Private-Sichtbarkeit fuer alle neu angelegten Repositories. "
+            "Die Sichtbarkeits-Auswahl im 'Neues Repository'-Dialog wird deaktiviert "
+            "und der Payload wird serverseitig auf private=True gesetzt, "
+            "unabhaengig vom UI-Zustand."
+        ),
+    )
+    args = parser.parse_args()
+    app  = App(nur_privat=args.nur_privat)
     app.mainloop()
